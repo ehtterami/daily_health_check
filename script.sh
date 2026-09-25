@@ -1,83 +1,106 @@
 #!/usr/bin/bash
 
-# daily_health_check
-# Daily base server health check and report
+# Exit On Error
+set -euo pipefail
 
-# Check running privilege
-if [ $EUID -ne 0 ]; then
-	echo "Script must run as root"
-	exit 1
-fi
+# Running Privilege Check
+privilege_check() {
+	if [ $EUID -ne 0 ]; then
+		echo "Script must run as root"
+		exit 1
+	fi
+}
 
-# Root disk usage check
-RDU="$(df / | awk 'NR==2 {print $5}' | tr -d '%')"
+# Log Name
+file_name() {
+	echo "$(date '+%Y-%m-%d')"
+}
 
-if [ "$RDU" -gt 80 ]; then
-	echo "Root disk usage is greater than 80 percent"
-fi
+# Log Path
+FILEPATH="/var/log/daily_health"
 
-# /var /home top five largest dirs
-DIRS=("/var" "/home")
-for d in "${DIRS[@]}"; do
-	USEDIR="$(du "$d" -d 2 | sort -nr | awk '$1 > 0 {print $2}' | head -5)"
-	echo $USEDIR
-	echo
-done
+# Root Disk Usage Check
+root_disk_usage() {
+	local ROOT_DISK_USAGE="$(df / | awk 'NR==2 {print $5}' | tr -d '%')"
+	echo $ROOT_DISK_USAGE
+}
 
-# Logged users count
-USRS="$(who | wc -l)"
-echo "Logged users: $USRS"
+# Directories Disk Usages
+dir_usage() {
+	local dirs=("$@")
 
-# Get failed ssh login attempts
-if [ -f "/var/log/secure" ]; then
-	ATTMPTS="$(grep -cE 'authentication failed|Failed password' /var/log/secure)"
-elif [ -f "/var/log/auth.log" ]; then
-	ATTMPTS="$(grep -cE 'authentication failed|Failed password' /var/log/auth.log)"
-else
-	ATTMPTS="$(journalctl -u sshd --no-pager 2> /dev/null | grep -cE 'authentication failed|Failed password')"
-fi
+	for d in "${dirs[@]}"; do
+		du $d -d 2 | sort -nr | awk '$1 > 0 {print $2}' | head -5
+	done
+}
 
-echo "Failed Login Attempts: $ATTMPTS"
+# Logged Users Count
+logged_users() {
+	local USERS="$(who | wc -l)"
+	echo $USERS
+}
 
-# Check if important services are running
-SERVS=("sshd" "rsyslog" "crond")
+# Get Failed SSH Login Attempts
+failed_login_attempts() {
+	local LOGS=("/var/log/secure" "/var/log/auth.log")
+	local ATTEMPTS=0
+	if [ -f $LOGS[0] ]; then
+		ATTEMPTS="$(grep -cE 'authentication failed|Failed password' $LOGS[0])"
+	elif [ -f $LOGS[1] ]; then
+		ATTEMPTS="$(grep -cE 'authentication failed|Failed password' $LOGS[1])"
+	else
+		ATTEMPTS="$(journalctl -u sshd --no-pager 2> /dev/null | grep -cE 'authentication failed|Failed password')"
+	fi
 
-for s in "${SERVS[@]}"; do
-	CMD="$(systemctl is-active --quiet $s && echo 'on' || echo 'off')"
-	echo $CMD
-done
+	echo $ATTEMPTS
+}
 
-# Get used and free memory state
-TOTMEM="$(free -h | awk 'NR==2 {print $2}')"
-USEDMEM="$(free -h | awk 'NR==2 {print $3}')"
-FREEMEM="$(free -h | awk 'NR==2 {print $4}')"
+# Get Service Status
+service_check() {
+	local SERVICE=$1
+	echo "$(systemctl is-active --quiet $SERVICE && echo 'on' || echo 'off')"
+}
 
-echo "Total Memo: $TOTMEM"
-echo "Used Memo: $USEDMEM"
-echo "Free Memo: $FREEMEM"
+# Get Memory Status
+memory_check() {
+	read -r TOTMEM USEDMEM FREMEM < <(free -h | awk 'NR==2 {print $2, $3, $4}')
+}
 
-if [ ! -d /var/log/daily_health/ ]; then
-	mkdir /var/log/daily_health/
-fi
+{
+	privilege_check
 
-FILNAME="$(date '+%Y-%m-%d')"
-FILPATH="/var/log/daily_health/$FILNAME"
+	FILENAME=$(file_name)
+	LOGPATH="$FILEPATH/$FILENAME"
 
-if [ ! -f $FILPATH ]; then
-	touch $FILPATH
-fi
+	if [[ ! -d $FILEPATH ]]; then
+		mkdir -p $FILEPATH
+	fi
+	if [[ ! -f $LOGPATH ]]; then
+		touch $LOGPATH
+	fi
 
-echo "Root Disk Usage Log" >> $FILPATH
-echo $RDU >> $FILPATH
-echo "Largest Dirs" >> $FILEPATH
-echo $USEDIR >> $FILEPATH
-echo "Logged Users" >> $FILEPATH
-echo $USRS
-echo "Failed Auth Attempts" >> $FILPATH
-echo $ATTMPTS
-echo "Services Stats" >> $FILPATH
-echo $CMD
-echo "Memory Stats" >> $FILPATH
-echo "T: $TOTMEM" >> $FILPATH
-echo "U: $USEDMEM" >> $FILPATH
-echo "F: $FREEMEM" >> $FILPATH
+	ROOT_DISK_USAGE=$(root_disk_usage)
+	DIRS=("/var" "/home")
+	FAILED_LOGINS=$(failed_login_attempts)
+	LOGGED_USERS=$(logged_users)
+
+	memory_check
+
+	echo "-------- $FILENAME --------" >> $LOGPATH
+	(( ROOT_DISK_USAGE > 80 )) && echo " ! RDU: $ROOT_DISK_USAGE%" || echo " - RDU: $ROOT_DISK_USAGE%" >> $LOGPATH
+	echo " - Disk Usage [ /var ]" >> $LOGPATH
+	dir_usage /var >> $LOGPATH
+	echo " - Disk Usage [ /home ]" >> $LOGPATH
+	dir_usage /home >> $LOGPATH
+	echo " - Service Check [ sshd ]" >> $LOGPATH
+	service_check sshd >> $LOGPATH
+	echo " - Service Check [ crond ]" >> $LOGPATH
+	service_check crond >> $LOGPATH
+	echo " - Failed Logins: $FAILED_LOGINS/$LOGGED_USERS" >> $LOGPATH
+	echo " - Logged Users: $LOGGED_USERS" >> $LOGPATH
+	echo " - Memo:" >> $LOGPATH
+	echo "   - Total: $TOTMEM" >> $LOGPATH
+	echo "   - Used: $USEDMEM" >> $LOGPATH
+	echo "   - Free: $FREMEM" >> $LOGPATH
+	echo "-------- End Of Log --------" >> $LOGPATH
+}
